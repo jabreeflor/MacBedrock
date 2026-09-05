@@ -14,8 +14,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>CFBundleIdentifier</key><string>com.jabreeflor.macbedrock</string>
 <key>CFBundleName</key><string>MacBedrock</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>0.1.0</string>
-<key>CFBundleVersion</key><string>1</string>
+<key>CFBundleShortVersionString</key><string>0.2.0</string>
+<key>CFBundleVersion</key><string>2</string>
 <key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>LSApplicationCategoryType</key><string>public.app-category.games</string>
 <key>NSHighResolutionCapable</key><true/>

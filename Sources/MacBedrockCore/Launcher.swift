@@ -5,7 +5,7 @@ public enum LauncherError: LocalizedError {
     case unsupportedMac, invalidDownload, checksumMismatch, invalidBundle, destinationExists, commandFailed(String)
     public var errorDescription: String? {
         switch self {
-        case .unsupportedMac: "This launcher requires Apple Silicon and macOS 14 or later. See Help for Intel Mac alternatives."
+        case .unsupportedMac: "This launcher requires Apple Silicon and macOS 14 or later. "
         case .invalidDownload: "The launcher download failed. Check your connection and try again."
         case .checksumMismatch: "The download did not match the verified release. Nothing was installed. Try again or check the upstream release."
         case .invalidBundle: "The launcher app is incomplete or unrecognized. Reveal its folder and move it aside before retrying."
@@ -16,13 +16,13 @@ public enum LauncherError: LocalizedError {
 }
 
 public enum Release {
-    public static let version = "0.1.13"
-    public static let appName = "Minecraft Bedrock Launcher.app"
-    public static let bundleID = "local.minecraft.bedrock.swiftlauncher"
-    public static let executable = "MinecraftBedrockLauncher"
-    public static let download = URL(string: "https://github.com/hugonote/mcpelauncher-swift/releases/download/v0.1.13/Minecraft.Bedrock.Launcher-0.1.13.dmg")!
-    public static let sha256 = "e56a08291837a998879a5bcdbae9fe90e0b60c17359a4c7e2d1af5b72e584c61"
-    public static let project = URL(string: "https://github.com/hugonote/mcpelauncher-swift")!
+    public static let version = "5.0.5"
+    public static let appName = "UTM.app"
+    public static let bundleID = "com.utmapp.UTM"
+    public static let executable = "UTM"
+    public static let download = URL(string: "https://github.com/utmapp/UTM/releases/download/v5.0.5/UTM.dmg")!
+    public static let sha256 = "713afe73c711f01344b8766654be531cd391ed2e30931206f43b5159f143764f"
+    public static let project = URL(string: "https://github.com/utmapp/UTM/releases/tag/v5.0.5")!
 
     public static func verify(_ data: Data, expected: String = sha256) throws {
         let actual = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
@@ -49,7 +49,7 @@ public struct MacHardware: Sendable {
 public struct LauncherInstallation: Sendable {
     public let root: URL
     public var app: URL { root.appendingPathComponent(Release.appName) }
-    public init(root: URL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/MacBedrock/Runtime")) {
+    public init(root: URL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/MacBedrock/Engine")) {
         self.root = root
     }
     public var isInstalled: Bool { (try? Self.validateBundle(app)) != nil }
@@ -104,11 +104,18 @@ public struct LauncherInstallation: Sendable {
         try Self.run("/usr/bin/hdiutil", ["attach", dmg.path, "-nobrowse", "-readonly", "-mountpoint", mount.path])
         defer { try? Self.run("/usr/bin/hdiutil", ["detach", mount.path, "-quiet"]) }
         try Task.checkCancellation()
-        try commitBundle(from: mount.appendingPathComponent(Release.appName))
-        await progress("Launcher installed. Next: sign in to Google Play.")
+        let source = mount.appendingPathComponent(Release.appName)
+        try Self.verifySignature(source)
+        try commitBundle(from: source)
+        await progress("Windows engine installed. Next: prepare your environment.")
     }
 
-    private static func run(_ executable: String, _ arguments: [String]) throws {
+    public static func verifySignature(_ app: URL) throws {
+        try run("/usr/bin/codesign", ["--verify", "--deep", "--strict", app.path])
+        try run("/usr/sbin/spctl", ["--assess", "--type", "execute", app.path])
+    }
+
+    public static func run(_ executable: String, _ arguments: [String]) throws {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments

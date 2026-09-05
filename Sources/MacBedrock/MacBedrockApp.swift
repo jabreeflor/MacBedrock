@@ -1,95 +1,81 @@
 import SwiftUI
 import AppKit
+import UniformTypeIdentifiers
 import MacBedrockCore
 
 @MainActor
-final class LauncherModel: ObservableObject {
-    @Published var installed = false
+final class EnvironmentModel: ObservableObject {
+    let environment = WindowsEnvironment()
+    @Published var prepared = false
     @Published var busy = false
-    @Published var status = "A few steps from your next world."
+    @Published var status = "Prepare Windows for your Microsoft Store copy."
     @Published var error: String?
-    let installation = LauncherInstallation()
-    let hardware = MacHardware.current
-
+    @Published var selectedISO: URL?
     init() { refresh() }
     func refresh() {
-        let wasInstalled = installed || UserDefaults.standard.bool(forKey: "hasInstalledLauncher")
-        installed = installation.isInstalled
-        if installed { UserDefaults.standard.set(true, forKey: "hasInstalledLauncher") }
-        else if wasInstalled {
-            status = "The launcher is no longer in its install folder."
-            error = "macOS may have moved the launcher to Trash. Reinstall only if you intend to review its first-open warning in Privacy & Security. If macOS identifies malware, do not override it. A local source-build recovery is documented in the README."
-            UserDefaults.standard.set(false, forKey: "hasInstalledLauncher")
-        }
+        prepared = environment.isPrepared
+        if selectedISO == nil, FileManager.default.fileExists(atPath: environment.windowsISO.path) { selectedISO = environment.windowsISO }
     }
-    func install() {
-        guard !busy else { return }
-        busy = true
-        error = nil
-        let destination = installation
+    func chooseISO() {
+        let panel = NSOpenPanel()
+        panel.title = "Choose Windows 11 25H2 English ARM64 v2 ISO"
+        panel.allowedContentTypes = [UTType(filenameExtension: "iso") ?? .data]
+        panel.canChooseDirectories = false
+        if panel.runModal() == .OK { selectedISO = panel.url }
+    }
+    func prepare() {
+        guard let iso = selectedISO, !busy else { return }
+        busy = true; error = nil
+        let destination = environment
         Task {
             do {
                 try await Task.detached {
-                    try await destination.install { message in
+                    try await destination.prepare(iso: iso) { message in
                         await MainActor.run { self.status = message }
                     }
                 }.value
                 refresh()
-            } catch { self.error = error.localizedDescription; status = "Setup needs attention. You can try again." }
+            } catch { self.error = error.localizedDescription; status = "Setup needs attention." }
             busy = false
         }
     }
-    func launch() {
-        refresh()
-        guard installed, !busy else { return }
-        error = nil
-        busy = true
-        NSWorkspace.shared.openApplication(at: installation.app, configuration: .init()) { _, launchError in
-            Task { @MainActor in
-                self.busy = false
-                if let launchError {
-                    self.error = "macOS could not open the launcher. If it was blocked, use System Settings → Privacy & Security → Open Anyway, then try again. \(launchError.localizedDescription)"
-                } else {
-                    self.status = "Launch requested. Complete any macOS prompt, then sign in inside the launcher."
+    func openWindows() {
+        guard prepared, !busy else { return }
+        error = nil; busy = true
+        let destination = environment
+        Task {
+            do {
+                try await Task.detached {
+                    try LauncherInstallation.validateBundle(destination.engine.app)
+                    try LauncherInstallation.verifySignature(destination.engine.app)
+                }.value
+                let configuration = NSWorkspace.OpenConfiguration()
+                // UTM 5.0.5 supports these launch defaults. Existing UTM processes
+                // keep their current renderer; the guide explains how to check it.
+                configuration.arguments = ["-QEMUDirectXDriver", "2", "-QEMURendererBackend", "2"]
+                NSWorkspace.shared.open([destination.bundle], withApplicationAt: destination.engine.app, configuration: configuration) { _, failure in
+                    Task { @MainActor in
+                        self.busy = false
+                        if let failure { self.error = failure.localizedDescription }
+                        else { self.status = "Environment opened. Press Run in the Windows window. Game readiness is not yet verified." }
+                    }
                 }
-            }
+            } catch { self.error = error.localizedDescription; busy = false }
         }
     }
-    func launcherTerminated() {
-        refresh()
-        status = "The Bedrock launcher closed."
-        error = "If it never opened, macOS may have blocked it. Check Privacy & Security or use the local source-build recovery in the README."
-        busy = false
-    }
     func reveal() {
-        let folder = installation.root
-        do {
-            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-            NSWorkspace.shared.open(folder)
-        } catch { self.error = error.localizedDescription }
+        NSWorkspace.shared.activateFileViewerSelecting([prepared ? environment.bundle : environment.root])
     }
 }
 
 @main
 struct MacBedrockApp: App {
-    @StateObject private var model = LauncherModel()
+    @StateObject private var model = EnvironmentModel()
     var body: some Scene {
         WindowGroup("MacBedrock") {
-            ContentView(model: model)
-                .frame(minWidth: 900, minHeight: 680)
-                .preferredColorScheme(.dark)
+            ContentView(model: model).frame(minWidth: 960, minHeight: 740).preferredColorScheme(.dark)
                 .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in model.refresh() }
-                .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didTerminateApplicationNotification)) { event in
-                    if let app = event.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication, app.bundleIdentifier == Release.bundleID { model.launcherTerminated() }
-                }
-        }
-        .defaultSize(width: 1020, height: 760)
-        .windowStyle(.hiddenTitleBar)
-        .commands {
-            CommandGroup(replacing: .help) {
-                Button("Launcher documentation") { NSWorkspace.shared.open(Release.project) }
-            }
-        }
+        }.defaultSize(width: 1060, height: 800).windowStyle(.hiddenTitleBar)
     }
 }
 
@@ -98,145 +84,110 @@ private let muted = Color(red: 0.60, green: 0.66, blue: 0.62)
 private let panel = Color(red: 0.085, green: 0.115, blue: 0.105)
 
 struct ContentView: View {
-    @ObservedObject var model: LauncherModel
-    @State private var tab = "Play"
+    @ObservedObject var model: EnvironmentModel
+    @State private var tab = "Environment"
     var body: some View {
         HStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 30) {
-                HStack(spacing: 10) {
-                    Image(systemName: "cube.fill").font(.system(size: 25)).foregroundStyle(lime)
-                    Text("MacBedrock").font(.system(size: 17, weight: .bold))
-                }.padding(.top, 35)
-                Text("YOUR NEXT ADVENTURE").font(.system(size: 9, weight: .bold, design: .monospaced)).tracking(1.5).foregroundStyle(muted)
-                VStack(spacing: 8) {
-                    nav("Play", icon: "play.square")
-                    nav("Setup guide", icon: "list.bullet.rectangle")
-                    nav("Help & about", icon: "questionmark.circle")
+                Label("MacBedrock", systemImage: "cube.fill").font(.system(size: 18, weight: .bold)).foregroundStyle(lime).padding(.top, 30)
+                Text("YOUR WINDOWS WORLD").font(.system(size: 9, design: .monospaced)).tracking(1.5).foregroundStyle(muted)
+                ForEach(["Environment", "Setup guide", "Help & about"], id: \.self) { name in
+                    Button(name) { tab = name }.buttonStyle(.plain).font(.system(size: 14, weight: .medium))
+                        .foregroundStyle(tab == name ? lime : muted)
                 }
                 Spacer()
-                VStack(alignment: .leading, spacing: 8) {
-                    Label(model.hardware.appleSilicon ? "Apple Silicon" : "Intel Mac", systemImage: "desktopcomputer").font(.system(size: 12, weight: .medium))
-                    Text("macOS \(ProcessInfo.processInfo.operatingSystemVersionString)").font(.system(size: 10)).foregroundStyle(muted)
-                    Text("UNOFFICIAL • INDEPENDENT").font(.system(size: 8, design: .monospaced)).tracking(1).foregroundStyle(muted)
-                }
-            }.padding(24).frame(width: 204).background(Color(red: 0.055, green: 0.075, blue: 0.067))
+                Label("Apple Silicon", systemImage: "desktopcomputer").font(.system(size: 12))
+                Text("CUSTOM WINDOWS ENVIRONMENT\nUTM / QEMU • EXPERIMENTAL").font(.system(size: 8, design: .monospaced)).foregroundStyle(muted).lineSpacing(5)
+            }.padding(25).frame(width: 210).background(Color(red: 0.055, green: 0.075, blue: 0.067))
             ScrollView {
                 VStack(alignment: .leading, spacing: 24) {
                     HStack {
-                        Text(tab.uppercased()).font(.system(size: 10, weight: .bold, design: .monospaced)).tracking(2).foregroundStyle(muted)
+                        Text(tab.uppercased()).font(.system(size: 10, design: .monospaced)).tracking(2)
                         Spacer()
-                        HStack(spacing: 6) {
-                            Circle().fill(model.installed ? lime : Color.orange).frame(width: 6, height: 6)
-                            Text(model.installed ? "Launcher installed" : "Setup required").font(.system(size: 11))
-                        }.padding(.horizontal, 12).padding(.vertical, 7).background(panel, in: Capsule())
-                    }
-                    if tab == "Play" { play }
+                        Label(model.prepared ? "VM prepared • gameplay unverified" : "Setup required", systemImage: "circle.fill").font(.system(size: 10)).foregroundStyle(lime)
+                    }.foregroundStyle(muted)
+                    if tab == "Environment" { environment }
                     else if tab == "Setup guide" { guide }
                     else { help }
                 }.padding(32)
             }.background(Color(red: 0.035, green: 0.055, blue: 0.047))
         }.tint(lime)
     }
-    func nav(_ title: String, icon: String) -> some View {
-        Button { tab = title } label: {
-            Label(title, systemImage: icon).font(.system(size: 13, weight: .medium))
-                .frame(maxWidth: .infinity, alignment: .leading).padding(12)
-                .background(tab == title ? lime.opacity(0.12) : .clear, in: RoundedRectangle(cornerRadius: 8))
-                .foregroundStyle(tab == title ? lime : muted)
-        }.buttonStyle(.plain)
-    }
-    var play: some View {
+    var environment: some View {
         VStack(alignment: .leading, spacing: 22) {
             ZStack(alignment: .bottomLeading) {
-                Landscape().frame(height: 245).clipped()
+                Landscape().frame(height: 230).clipped()
                 LinearGradient(colors: [.clear, .black.opacity(0.85)], startPoint: .top, endPoint: .bottom)
-                VStack(alignment: .leading, spacing: 10) {
-                    Text("MINECRAFT: BEDROCK EDITION").font(.system(size: 10, weight: .bold, design: .monospaced)).tracking(2).foregroundStyle(lime)
-                    Text("Your Mac.\nYour next world.").font(.system(size: 38, weight: .bold, design: .rounded)).lineSpacing(-3)
-                    Text("A native starting point for Bedrock on Apple Silicon.").font(.system(size: 12)).foregroundStyle(.white.opacity(0.8))
-                }.padding(26)
+                VStack(alignment: .leading, spacing: 9) {
+                    Text("MINECRAFT FOR WINDOWS").font(.system(size: 10, weight: .bold, design: .monospaced)).tracking(2).foregroundStyle(lime)
+                    Text("Your purchase.\nA new place to play.").font(.system(size: 35, weight: .bold, design: .rounded))
+                    Text("A dedicated Windows environment for your Mac.").font(.system(size: 12))
+                }.padding(24)
             }.clipShape(RoundedRectangle(cornerRadius: 14))
             VStack(alignment: .leading, spacing: 16) {
-                HStack(alignment: .top) {
-                    VStack(alignment: .leading, spacing: 7) {
-                        Text(model.installed ? "Ready for the next step" : "Let’s get you set up").font(.system(size: 21, weight: .semibold))
-                        Text(model.installed ? "Open the launcher to sign in and choose a game version." : "Install the community launcher, then sign in to get your game.")
-                            .font(.system(size: 12)).foregroundStyle(muted)
-                    }
-                    Spacer()
-                    Image(systemName: model.installed ? "checkmark.seal" : "arrow.down.app").font(.system(size: 26)).foregroundStyle(lime)
+                Text(model.prepared ? "Your environment is prepared" : "Build your Windows environment").font(.system(size: 22, weight: .semibold))
+                Text(model.prepared ? "Open Windows, finish setup, then install your Microsoft Store copy of Minecraft." : "Download Windows from Microsoft, choose the ISO, and let MacBedrock create your VM.").font(.system(size: 13)).foregroundStyle(muted)
+                if !model.prepared {
+                    Link("Download Windows ARM64 from Microsoft ↗", destination: URL(string: "https://www.microsoft.com/en-us/software-download/windows11arm64")!)
+                    Text("Required image: Windows 11 25H2 · English (United States) · ARM64 v2").font(.system(size: 11)).foregroundStyle(muted)
+                    HStack { Button("Choose Windows ISO", action: model.chooseISO); Text(model.selectedISO?.lastPathComponent ?? "No ISO selected").font(.system(size: 11)).foregroundStyle(muted) }
                 }
-                if !model.hardware.supported {
-                    Text("This route requires Apple Silicon and macOS 14+. Open Help for alternatives.").foregroundStyle(.orange)
-                }
-                if let error = model.error {
-                    Text(error).font(.system(size: 12)).foregroundStyle(.orange).textSelection(.enabled)
-                }
-                HStack(spacing: 14) {
+                if let error = model.error { Text(error).foregroundStyle(.orange).font(.system(size: 12)).textSelection(.enabled) }
+                HStack {
                     Button {
-                        if model.installed { model.launch() } else { model.install() }
+                        if model.prepared { model.openWindows() } else { model.prepare() }
                     } label: {
-                        Label(model.busy ? "Working…" : model.installed ? "Open Bedrock launcher" : "Install Bedrock launcher", systemImage: model.installed ? "play.fill" : "arrow.down")
-                            .font(.system(size: 13, weight: .bold)).padding(.horizontal, 8).padding(.vertical, 9)
-                    }.buttonStyle(.plain).foregroundStyle(.black)
-                        .background(lime, in: RoundedRectangle(cornerRadius: 8))
-                        .opacity(model.busy || !model.hardware.supported ? 0.5 : 1)
-                        .disabled(model.busy || !model.hardware.supported)
+                        Label(model.busy ? "Working…" : model.prepared ? "Open Windows environment" : "Create environment", systemImage: model.prepared ? "play.fill" : "plus.rectangle.on.rectangle").padding(8)
+                    }.buttonStyle(.borderedProminent).foregroundStyle(.black)
+                        .disabled(model.busy || (!model.prepared && model.selectedISO == nil) || !MacHardware.current.supported)
                     if model.busy { ProgressView().controlSize(.small) }
                     else { Button("Setup guide") { tab = "Setup guide" }.buttonStyle(.plain).foregroundStyle(muted) }
                 }
                 Text(model.status).font(.system(size: 11)).foregroundStyle(muted).accessibilityLabel("Status: \(model.status)")
             }.padding(22).background(panel, in: RoundedRectangle(cornerRadius: 12))
-            HStack(alignment: .top, spacing: 18) {
-                info("01", "Bring your game", "Requires Minecraft purchased on Google Play.")
-                info("02", "Keep your account", "Sign in inside the community launcher.")
-                info("03", "Find your world", "Download a compatible version and press Play.")
+            HStack(alignment: .top, spacing: 20) {
+                info("4 CORES / 8 GB", "Windows ARM64", "Hardware virtualization on Apple Silicon.")
+                info("80 GB CAPACITY", "A growing disk", "Uses space as needed. Keep free space available.")
+                info("DIRECTX 11", "Experimental graphics", "Triton + DXMT. Minecraft gameplay is unverified.")
             }
-            Text("Uses hugonote’s Minecraft Bedrock Launcher and the mcpelauncher runtime. Game files are downloaded separately. Version and multiplayer compatibility vary.")
-                .font(.system(size: 10)).foregroundStyle(muted)
+            Text("Your Microsoft Store purchase is used inside Windows. A Windows license is separate. No game or account credentials are bundled.").font(.system(size: 11)).foregroundStyle(muted)
         }
     }
-    func info(_ number: String, _ title: String, _ detail: String) -> some View {
+    func info(_ tag: String, _ title: String, _ detail: String) -> some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text(number).font(.system(size: 10, design: .monospaced)).foregroundStyle(lime)
-            Text(title).font(.system(size: 12, weight: .semibold))
-            Text(detail).font(.system(size: 11)).foregroundStyle(muted).fixedSize(horizontal: false, vertical: true)
+            Text(tag).font(.system(size: 9, design: .monospaced)).foregroundStyle(lime)
+            Text(title).font(.system(size: 13, weight: .semibold))
+            Text(detail).font(.system(size: 11)).foregroundStyle(muted)
         }.frame(maxWidth: .infinity, alignment: .leading)
-    }
-    var guide: some View {
-        VStack(alignment: .leading, spacing: 25) {
-            Text("From setup to spawn.").font(.system(size: 32, weight: .bold, design: .rounded))
-            step("1", "Own the Android edition", "The Google Play account you use must own Minecraft. A Windows, Xbox, Java, or iPhone purchase does not unlock the Google Play download.")
-            Link("View Minecraft on Google Play ↗", destination: URL(string: "https://play.google.com/store/apps/details?id=com.mojang.minecraftpe")!)
-            step("2", "Install and open the launcher", "Use Install on the Play screen. MacBedrock checks the download and installs it in your user folder. If macOS blocks the app, open Privacy & Security and use Open Anyway for Minecraft Bedrock Launcher.")
-            step("3", "Sign in and download", "In Minecraft Bedrock Launcher, sign in with the Google account that owns Minecraft. Let it install its runtime, choose an available compatible version, and download the game.")
-            step("4", "Press Play", "Start Minecraft from that launcher. Sign in to your Microsoft account in the game for supported online features. Friends and servers need compatible game versions; current Realms support is not guaranteed.")
-            Button("Back to Play") { tab = "Play" }.buttonStyle(.borderedProminent)
-        }
     }
     func step(_ number: String, _ title: String, _ detail: String) -> some View {
         HStack(alignment: .top, spacing: 16) {
-            Text(number).font(.system(size: 15, weight: .bold, design: .monospaced)).foregroundStyle(lime).frame(width: 32, height: 32).background(lime.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
+            Text(number).font(.system(size: 16, weight: .bold, design: .monospaced)).foregroundStyle(lime).frame(width: 30)
             VStack(alignment: .leading, spacing: 8) {
-                Text(title).font(.system(size: 17, weight: .semibold))
+                Text(title).font(.system(size: 18, weight: .semibold))
                 Text(detail).font(.system(size: 13)).foregroundStyle(muted).fixedSize(horizontal: false, vertical: true)
             }
         }
     }
+    var guide: some View {
+        VStack(alignment: .leading, spacing: 26) {
+            Text("From Windows to your world.").font(.system(size: 30, weight: .bold, design: .rounded))
+            step("1", "Start the environment", "Open your environment and press Run in UTM. Click the VM and press a key when asked to boot from CD. If an EFI shell appears, type exit, choose Boot Manager, then the first USB drive. Press a key at the CD prompt.")
+            step("2", "Install Windows", "Choose your region and licensed Windows edition. Review Microsoft’s license terms yourself. Install only to the empty 80 GB virtual disk. Your Mac’s real disk is not attached. After the first restart, let Windows boot without pressing a key. If network setup needs a driver, choose Install driver and browse MacBedrock-Drivers → Drivers → NetKVM → w10 → ARM64.")
+            step("3", "Install the graphics driver", "The MacBedrock-Drivers CD is mounted. Run its guest tools installer and select the experimental 3D graphics driver when prompted, then restart Windows. In UTM Settings → QEMU, use ANGLE Metal and DXMT for DirectX. Do not select D3DMetal unless separately configured.")
+            step("4", "Use your Microsoft Store purchase", "Inside Windows, open Microsoft Store and sign in to the account that owns Minecraft for Windows. Install it from your library and launch it. The app never asks for your password.")
+            step("5", "Check actual gameplay", "In Windows, run dxdiag and confirm a Triton/Neptune adapter and Direct3D feature level 11_0. Start Minecraft at 1280 × 720 with modest render distance. Create a world, check audio and input, then test joining friends. Booting Windows alone does not establish game compatibility.")
+        }
+    }
     var help: some View {
-        VStack(alignment: .leading, spacing: 24) {
-            Text("A little help along the way.").font(.system(size: 30, weight: .bold, design: .rounded))
-            step("?", "An unofficial route", "MacBedrock installs a community launcher, not a new port of Minecraft. Rendering, game updates, and multiplayer depend on mcpelauncher. No game files or credentials are bundled with MacBedrock.")
-            step("!", "Blocked by macOS?", "The upstream launcher is not notarized. Review it in System Settings → Privacy & Security → Open Anyway. MacBedrock leaves Gatekeeper enabled.")
-            step("↻", "Setup interrupted?", "If macOS moved the launcher to Trash, review the first-open warning or use the README’s local source-build recovery. Retry Install. Downloads are verified before installation. If an incomplete launcher already exists, reveal its folder and move that app aside, then retry. This does not remove your worlds. Upstream launcher updates are managed in that launcher.")
-            step("i", "Using an Intel Mac?", "This app’s install route supports Apple Silicon only. Consult the legacy mcpelauncher documentation for Intel builds and their version limits, or play through a Windows computer you can stream to your Mac.")
-            HStack {
-                Button("Reveal launcher folder", action: model.reveal)
-                Link("Upstream launcher ↗", destination: Release.project)
-            }
-            Link("Runtime compatibility & known issues ↗", destination: URL(string: "https://github.com/minecraft-linux/mcpelauncher-manifest")!)
-            Text("MacBedrock 0.1.0 • Initial launcher: \(Release.version)\nIndependent project. Not affiliated with Mojang, Microsoft, Google, or upstream maintainers.")
-                .font(.system(size: 11)).foregroundStyle(muted)
+        VStack(alignment: .leading, spacing: 26) {
+            Text("Your environment, explained.").font(.system(size: 30, weight: .bold, design: .rounded))
+            step("i", "Built on open-source components", "MacBedrock creates and opens a dedicated UTM/QEMU Windows VM. Triton and DXMT provide an experimental DirectX 11 path. This is not a native port of Minecraft or a new hypervisor. DirectX 12 features and game compatibility are not promised.")
+            step("!", "If macOS blocks an app", "The downloaded UTM engine must pass checksum, signature, and Gatekeeper assessment. MacBedrock does not remove quarantine or disable Gatekeeper. This MacBedrock app is locally built; public downloads require developer signing and notarization for a smooth first launch.")
+            step("↻", "Keep your worlds safe", "Shut Windows down before backing up the entire .utm bundle. Retrying setup never overwrites an existing environment. The disk can grow to 80 GB, so monitor free storage. If setup reports an incomplete bundle, reveal it and move it aside manually before retrying.")
+            HStack { Button("Reveal environment", action: model.reveal); Link("Engine release notes ↗", destination: Release.project) }
+            Link("Windows guest tools guide ↗", destination: URL(string: "https://docs.getutm.app/guest-support/windows/")!)
+            Text("MacBedrock 0.2.0 • UTM 5.0.5 beta\nIndependent project. Not affiliated with Mojang, Microsoft, Apple, or UTM.").font(.system(size: 11)).foregroundStyle(muted)
         }
     }
 }
