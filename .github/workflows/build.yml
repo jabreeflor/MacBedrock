@@ -1,0 +1,20 @@
+name: Build MacBedrock
+on:
+  push:
+    branches: [main, 'codex/**']
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test installer safety and compatibility checks
+        run: swift test
+      - name: Build Apple Silicon application
+        run: scripts/build-app.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MacBedrock-macOS-arm64
+          path: dist/MacBedrock-macOS-arm64.zip
